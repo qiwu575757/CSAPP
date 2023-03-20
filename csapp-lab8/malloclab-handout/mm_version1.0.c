@@ -234,7 +234,7 @@ static void *coalesce(void *bp) {
         return bp;
     }
 
-    /* 需要先将本空闲块从空闲链表中移除 */
+    /* 需要先将本空闲块从空闲链表中移除。这一点忽略了，找了半天bug，呜呜呜 */
     delete_from_empty_list(bp);
 
     if (prev_alloc && !next_alloc) {
