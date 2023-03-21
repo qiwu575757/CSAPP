@@ -74,6 +74,9 @@ team_t team = {
 /* 为了能存储 hdr pred succ ftr 最少需要 16B */
 #define MIN_BLOCK_SIZE      16 // 最小块的大小
 
+/* 用来控制 split_block 函数何时决定 split */
+#define CONTROL 10000
+
 void* heap_listp = 0;
 void* list_root[MAX_EMPTY_LISTS] = {0}; // 作为空闲链表的头结点数组
 
@@ -86,6 +89,7 @@ static void delete_from_empty_list(void *bp);
 static void mm_check(void);
 static void block_in_empty_list(void *bp);
 static void print_empty_list(char *s);
+static void split_block(void *bp, size_t asize);
 
 /* 
  * mm_init - initialize the malloc package.
@@ -200,20 +204,62 @@ void *mm_realloc(void *ptr, size_t size)
     }
 
     /* 
-        如后一个块未分配且大小合适，可直接合并后返回
-        虽然这样可能会造成一些不必要的内部碎片，但在实验测例中效果明显
+        可根据前后块的分配和大小情况进一步合并来满足 realloc
+        虽然这样可能会造成一些不必要的内部碎片，所以增加一个 split_block 函数来减少内部碎片
      */
+    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(ptr)));
+    size_t prev_size = GET_SIZE(HDRP(PREV_BLKP(ptr)));
+    void *pblk = PREV_BLKP(ptr);
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
     size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
-    if (!next_alloc && (asize <= next_size + old_size)) {
-        /* 将下一个块在空闲链表中的前驱后继维护好 */
-        delete_from_empty_list(NEXT_BLKP(ptr));
+    void *nblk = NEXT_BLKP(ptr);
 
-        PUT(HDRP(ptr), PACK(next_size+old_size, 1));
-        /* 使用 FTBR 宏时，需要通过hdr 得到size, 然后找到 ftr 进行设置 */
-        PUT(FTRP(ptr), PACK(next_size+old_size,1));     
+    if (prev_alloc && !next_alloc && (asize <= next_size + old_size)) {
+        delete_from_empty_list(nblk);
+
+        PUT(HDRP(ptr), PACK(next_size + old_size, 1));
+        PUT(FTRP(ptr), PACK(next_size + old_size, 1));
+
+        /* 减少内部碎片 */
+        /* 搞笑的是，使用该函数成本太高，降低了得分 */
+        //split_block(ptr, asize); 
 
         return ptr;
+    }
+    else if (!prev_alloc && next_alloc && (asize <= prev_size + old_size)) {
+        delete_from_empty_list(pblk);
+
+        PUT(HDRP(pblk), PACK(prev_size + old_size, 1));
+        PUT(FTRP(ptr), PACK(prev_size + old_size, 1));
+        /* move data 
+        `memcpy()` 和 `memmove()` 都是C语言中的内存拷贝函数，但是它们有一些区别：
+        1. 相同点：都是用来拷贝指定长度的内存块。
+        2. 不同点：`memcpy()` 和 `memmove()` 在处理重叠内存块时的行为不同。  
+            - `memcpy()` 在拷贝内存块时不考虑源内存块和目标内存块是否重叠，如果它们重叠，
+                 可能会导致数据错误。  
+            - `memmove()` 会判断源内存块和目标内存块是否重叠，如果它们重叠，
+                 `memmove()` 会先将源内存块的数据拷贝到临时缓冲区中，
+                 然后再将临时缓冲区的数据拷贝到目标内存块中，这样就避免了数据错误的问题。
+        因此，如果要拷贝的内存块不重叠，可以使用 `memcpy()` 来提高效率；
+        如果要拷贝的内存块可能重叠，应该使用 `memmove()` 来保证数据的正确性。
+        */
+        memmove(pblk, ptr, old_size-DSIZE);
+
+        //split_block(pblk, asize);
+
+        return pblk;
+    }
+    else if (!prev_alloc && !next_alloc && (asize <= prev_size + next_size + old_size)){
+        delete_from_empty_list(pblk);
+        delete_from_empty_list(nblk);
+
+        PUT(HDRP(pblk), PACK(prev_size + next_size + old_size, 1));
+        PUT(FTRP(nblk), PACK(prev_size + next_size + old_size, 1));
+        memmove(pblk, ptr, old_size-DSIZE);
+
+        //split_block(pblk, asize);
+
+        return pblk;
     }
 
     if (MY_DEBUG)
@@ -224,7 +270,7 @@ void *mm_realloc(void *ptr, size_t size)
  *      同理，需要先 memcpy 再 free, 因为free时会在空闲块负载部分加上 pred, succ
  */
     void *new_ptr = mm_malloc(asize);
-    memcpy(new_ptr, ptr, old_size);
+    memcpy(new_ptr, ptr, old_size-DSIZE);
     mm_free(ptr);
 
     if (MY_CHECK)
@@ -415,6 +461,33 @@ static void delete_from_empty_list(void *bp) {
 
     if (MY_PRINT) 
         print_empty_list("called by delete_from_empty_list");
+}
+
+/* 对一个已分配的块进行分割以减少内部碎片，仅供realloc 使用 */
+static void split_block(void *bp, size_t asize) {
+    size_t avail_size = GET_SIZE(HDRP(bp));
+    size_t left_size = avail_size - asize;
+
+    /*
+        若剩余部分小于最小块，将整个块全部分配
+        由于显示空闲链表需要存储前驱后继的地址，最小块要求更大
+    */
+    if (avail_size < asize + CONTROL*MIN_BLOCK_SIZE ) {
+        PUT(HDRP(bp), PACK(avail_size, 1));
+        PUT(FTRP(bp), PACK(avail_size, 1));
+
+        return;
+    }
+
+    /* 剩余部分大于最小块，需要设置剩余块 */ 
+    PUT(HDRP(bp), PACK(asize, 1));
+    /* 因为 FTRP 是根据 hdr中的size来确定的，所以可直接调用 */
+    PUT(FTRP(bp), PACK(asize, 1));
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(left_size, 0));
+    PUT(FTRP(NEXT_BLKP(bp)), PACK(left_size, 0));
+
+    /* 将剩余的空闲块插入空闲链表 */ 
+    add_to_empty_list(NEXT_BLKP(bp));
 }
 
 /* 依次实现各检查项 */
